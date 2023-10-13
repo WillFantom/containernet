@@ -82,7 +82,7 @@ class Node( object ):
 
     portBase = 0  # Nodes always start with eth0/port0, even in OF 1.0
 
-    def __init__( self, name, inNamespace=True, **params ):
+    def __init__( self, name, inNamespace=True, mountNamespace=False, **params ):
         """name: name of node
            inNamespace: in network namespace?
            privateDirs: list of private directory strings or tuples
@@ -94,6 +94,8 @@ class Node( object ):
         self.name = params.get( 'name', name )
         self.privateDirs = params.get( 'privateDirs', [] )
         self.inNamespace = params.get( 'inNamespace', inNamespace )
+        self.mountNamespace = params.get( 'mountNamespace', mountNamespace )
+        self.mountedNamespace = False
 
         # Python 3 complains if we don't wait for shell exit
         self.waitExited = params.get( 'waitExited', Python3 )
@@ -124,6 +126,10 @@ class Node( object ):
         self.master, self.slave = None, None  # pylint
         self.startShell()
         self.mountPrivateDirs()
+
+        # Mount the netns
+        if self.inNamespace and self.mountNamespace:
+            self.mountedNamespace = self.mount_ns()
 
     # File descriptor to node mapping support
     # Class variables and methods
@@ -248,6 +254,49 @@ class Node( object ):
         if self.slave:
             os.close(self.slave)
             self.slave = None
+        self.unmount_ns()
+
+    # Namespace mount management 
+
+    def mount_ns(self, path_pattern="/run/netns/mn.*"):
+        """Mount the network namespace of a Node to the default location (being /run/netns/mn.*)
+           """
+        if self.inNamespace:
+            pid_cmd = ['echo', '$$']
+            shell_proc = self.popen( "/bin/bash") 
+            if shell_proc.pid == None:
+                warn( 'failed to get netns pid for ' + self.name )
+                return False
+            touch_cmd = [ 'touch', path_pattern.replace("*", self.name)]
+            out, err, ret = errRun( touch_cmd )
+            if ret != 0:
+                warn( 'failed to touch netns file for ' + self.name )
+                warn ( err )
+                warn ( out )
+                return False
+            mount_cmd = ['mount', '-o', 'bind', '/proc/' + str(shell_proc.pid) + '/ns/net',
+                path_pattern.replace("*", self.name) ]
+            out, err, ret = errRun( mount_cmd )
+            if ret != 0:
+                warn( 'failed to mount netns for ' + self.name )
+                warn ( err )
+                warn ( out )
+                return False
+            shell_proc.kill()
+        return True
+
+    def unmount_ns(self, path_pattern="/run/netns/mn.*"):
+        """Unmount the network namespace of a Node from the default location (being /run/netns/mn.*)
+           """
+        if self.inNamespace and self.mountedNamespace:
+            unmount_cmd = ['ip', 'netns', 'del', 'mn.' + self.name ]
+            out, err, ret = errRun( unmount_cmd )
+            if ret != 0:
+                warn( 'failed to unmount netns for ' + self.name )
+                warn ( err )
+                warn ( out )
+                return False
+        return True
 
     # Subshell I/O, commands and control
 
@@ -715,7 +764,7 @@ class Docker ( Host ):
     We use the docker-py client library to control docker.
     """
 
-    def __init__(self, name, dimage=None, dcmd=None, build_params={},
+    def __init__(self, name, dimage=None, dcmd=None, build_params={}, mountNamespace=False,
                  **kwargs):
         """
         Creates a Docker container as Mininet host.
@@ -738,6 +787,7 @@ class Docker ( Host ):
         * updateMemoryLimits(...)
         """
         self.dimage = dimage
+        self.mountNamespace = mountNamespace
         self.dnameprefix = "mn"
         self.dcmd = dcmd if dcmd is not None else "/bin/bash"
         self.dc = None  # pointer to the dict containing 'Id' and 'Warnings' keys of the container
@@ -840,7 +890,7 @@ class Docker ( Host ):
             storage_opt=self.storage_opt,
             # Assuming Docker uses the cgroupfs driver, we set the parent to safely
             # access cgroups when modifying resource limits.
-            cgroup_parent='/docker'
+            cgroup_parent='docker.slice'
         )
 
         if kwargs.get("rm", False):
@@ -875,6 +925,15 @@ class Docker ( Host ):
         # fetch information about new container
         self.dcinfo = self.dcli.inspect_container(self.dc)
         self.did = self.dcinfo.get("Id")
+        self.dname = self.dcinfo.get("Name")[1:]
+        self.dpid = self.dcinfo.get("State", {}).get("Pid", -1)
+
+        # mount the netns to /run/netns/
+        if self.mountNamespace:
+            mount_cmd = [ 'ln', '-sfT', '/proc/' + str(self.dpid) + '/ns/net', '/run/netns/mn.' + str(self.dname) ]
+            out, err, code = errRun( mount_cmd )
+            if code != 0:
+                warn( 'failed to mount container ' + str(self.dname) + ' namespace\n' )
 
         # call original Node.__init__
         Host.__init__(self, name, **kwargs)
@@ -1006,6 +1065,7 @@ class Docker ( Host ):
 
     def terminate( self ):
         """ Stop docker container """
+        errRun( ['unlink', '/run/netns/mn.' + str(self.dname)] )
         if not self._is_container_running():
             return
         try:
